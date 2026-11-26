@@ -71,33 +71,35 @@ private:
     double currentSampleRate = 48000.0;
 
     // Parameters
-    std::atomic<int> bassStyle{0};       // 0:KBBB, 1:Offbeat, 2:Gallop, 3:Triplet, 4:SubReese
-    std::atomic<int> scMode{0};          // 0:Auto (SC+BPM fallback), 1:Sidechain Only, 2:BPM Groove Only
-    std::atomic<float> subDuckPct{92.0f};
+    std::atomic<int> bassStyle{0};
+    std::atomic<int> scMode{0};
+    std::atomic<bool> bypassed{false};
+    std::atomic<float> subDuckPct{95.0f};
     std::atomic<float> topDuckPct{40.0f};
     std::atomic<float> holdMs{18.0f};
-    std::atomic<float> releaseMs{58.0f};
+    std::atomic<float> releaseMs{55.0f};
     std::atomic<float> xoverHz{140.0f};
     std::atomic<float> monoSubHz{120.0f};
-    std::atomic<float> phaseDeg{0.0f};   // -180..180
-    std::atomic<float> microDelayMs{0.0f}; // 0..12
+    std::atomic<float> phaseDeg{0.0f};
+    std::atomic<float> microDelayMs{0.0f};
+    std::atomic<float> bassTrimDb{0.0f};
     std::atomic<bool> invert180{false};
     std::atomic<float> scThreshDb{-28.0f};
 
-    // LR4 Crossover (2 cascaded 2nd-order per band per channel)
+    // LR4 Crossover + Sub Correlation filters
     Biquad lp1[2], lp2[2], hp1[2], hp2[2];
     Biquad monoLp1[2], monoLp2[2], monoHp1[2], monoHp2[2];
+    Biquad corrKickLp1, corrKickLp2, corrBassLp1, corrBassLp2;
     AllPass1 apPhase[2];
 
-    // Micro-delay line (up to 20ms at 192kHz -> 4096 samples)
     static constexpr int kDelayBufSize = 4096;
     std::array<std::vector<float>, 2> delayBuf;
     int delayWriteIdx = 0;
 
-    // Sidechain envelope state
+    // Sidechain envelope & holdover state
     float scEnv = 0.0f;
     int holdCounter = 0;
-    double lastPpq = -1.0;
+    int scHoldoverSamples = 0;
 
     // Telemetry & Capture buffers
     static constexpr int kCaptureSize = 16384;

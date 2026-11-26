@@ -56,9 +56,12 @@ void PsyKickBassProProcessor::prepareToPlay(double sampleRate, int) {
         apPhase[ch].reset();
         std::fill(delayBuf[ch].begin(), delayBuf[ch].end(), 0.0f);
     }
+    corrKickLp1.reset(); corrKickLp2.reset();
+    corrBassLp1.reset(); corrBassLp2.reset();
     delayWriteIdx = 0;
     scEnv = 0.0f;
     holdCounter = 0;
+    scHoldoverSamples = 0;
     updateFilterCoeffs();
 }
 
@@ -68,9 +71,8 @@ void PsyKickBassProProcessor::updateFilterCoeffs() {
     float xo = xoverHz.load();
     float ms = monoSubHz.load();
     float deg = phaseDeg.load();
-    // Map |deg| (0..180) to all-pass center frequency 18..420 Hz for smooth 65Hz sub rotation
     float normDeg = std::abs(deg) / 180.0f;
-    float apFc = 18.0f * std::pow(24.0f, normDeg); // 18Hz -> 432Hz
+    float apFc = 18.0f * std::pow(24.0f, normDeg);
 
     for (int ch = 0; ch < 2; ++ch) {
         lp1[ch].setLowpass(currentSampleRate, xo);
@@ -85,6 +87,10 @@ void PsyKickBassProProcessor::updateFilterCoeffs() {
 
         apPhase[ch].setFreq(currentSampleRate, apFc);
     }
+    corrKickLp1.setLowpass(currentSampleRate, 120.0f);
+    corrKickLp2.setLowpass(currentSampleRate, 120.0f);
+    corrBassLp1.setLowpass(currentSampleRate, 120.0f);
+    corrBassLp2.setLowpass(currentSampleRate, 120.0f);
 }
 
 void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) {
@@ -110,11 +116,19 @@ void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     for (int c = 0; c < numCh; ++c)
         bassPeak = juce::jmax(bassPeak, mainBus.getMagnitude(c, 0, numSamples));
 
-    scSignalPresent.store(scPeak > 0.0008f);
+    // 1.5s holdover so Sidechain indicator & trigger mode don't flicker between kicks!
+    if (scPeak > 0.001f) {
+        scHoldoverSamples = (int)(1.5 * currentSampleRate);
+    } else if (scHoldoverSamples > 0) {
+        scHoldoverSamples = juce::jmax(0, scHoldoverSamples - numSamples);
+    }
+
+    bool scLockedNow = (scHoldoverSamples > 0);
+    scSignalPresent.store(scLockedNow);
     bassSignalPresent.store(bassPeak > 0.0008f);
 
     int mode = scMode.load();
-    bool useBpm = (mode == 2) || (mode == 0 && scPeak <= 0.0008f);
+    bool useBpm = (mode == 2) || (mode == 0 && !scLockedNow);
 
     double bpm = 142.0;
     double ppqStart = 0.0;
@@ -127,12 +141,14 @@ void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         }
     }
 
+    bool isBypassed = bypassed.load();
     float subDuck = subDuckPct.load() * 0.01f;
     float topDuck = topDuckPct.load() * 0.01f;
     float threshLin = juce::Decibels::decibelsToGain(scThreshDb.load());
     int holdSamp = (int)(holdMs.load() * 0.001f * currentSampleRate);
     float relCoeff = std::exp(-1.0f / juce::jmax(1.0f, releaseMs.load() * 0.001f * (float)currentSampleRate));
     float attCoeff = std::exp(-1.0f / juce::jmax(1.0f, 0.0015f * (float)currentSampleRate));
+    float trimGain = juce::Decibels::decibelsToGain(bassTrimDb.load());
 
     float delaySampF = juce::jlimit(0.0f, 15.0f, microDelayMs.load()) * 0.001f * (float)currentSampleRate;
     int dInt = (int)delaySampF;
@@ -143,7 +159,7 @@ void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     bool useAp = std::abs(phaseDeg.load()) > 2.0f;
 
     float maxGr = 0.0f;
-    double dotSum = 0.0, eK = 0.0, eB = 0.0;
+    double dotSub = 0.0, eKSub = 0.0, eBSub = 0.0;
 
     float* outL = mainBus.getWritePointer(0);
     float* outR = (numCh > 1) ? mainBus.getWritePointer(1) : outL;
@@ -151,7 +167,6 @@ void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     const float* scR = (scCh > 1) ? scBus.getReadPointer(1) : scL;
 
     double beatsPerSample = (bpm / 60.0) / currentSampleRate;
-
     const juce::SpinLock::ScopedTryLockType lock(dataLock);
 
     for (int i = 0; i < numSamples; ++i) {
@@ -160,7 +175,6 @@ void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         float bInR = outR[i];
         float bDryMono = 0.5f * (bInL + bInR);
 
-        // 1. Sidechain trigger (Real Audio or BPM Groove)
         float trig = 0.0f;
         if (!useBpm && scL != nullptr) {
             float absK = std::abs(kMono);
@@ -184,46 +198,49 @@ void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
             scEnv *= relCoeff;
         }
 
-        // 2. Micro-delay + Phase Rotation + Polarity Invert on Bass
-        float chans[2] = { bInL, bInR };
-        for (int c = 0; c < 2; ++c) {
-            delayBuf[c][delayWriteIdx] = chans[c];
-            int idx0 = (delayWriteIdx - dInt + kDelayBufSize) % kDelayBufSize;
-            int idx1 = (idx0 - 1 + kDelayBufSize) % kDelayBufSize;
-            float delayed = delayBuf[c][idx0] * (1.0f - dFrac) + delayBuf[c][idx1] * dFrac;
-            if (useAp) delayed = apPhase[c].process(delayed) * (pSign < 0.0f ? -1.0f : 1.0f);
-            if (inv) delayed = -delayed;
-            chans[c] = delayed;
+        if (!isBypassed) {
+            float chans[2] = { bInL, bInR };
+            for (int c = 0; c < 2; ++c) {
+                delayBuf[c][delayWriteIdx] = chans[c];
+                int idx0 = (delayWriteIdx - dInt + kDelayBufSize) % kDelayBufSize;
+                int idx1 = (idx0 - 1 + kDelayBufSize) % kDelayBufSize;
+                float delayed = delayBuf[c][idx0] * (1.0f - dFrac) + delayBuf[c][idx1] * dFrac;
+                if (useAp) delayed = apPhase[c].process(delayed) * (pSign < 0.0f ? -1.0f : 1.0f);
+                if (inv) delayed = -delayed;
+                chans[c] = delayed;
+            }
+            delayWriteIdx = (delayWriteIdx + 1) % kDelayBufSize;
+
+            float subL = lp2[0].process(lp1[0].process(chans[0]));
+            float subR = lp2[1].process(lp1[1].process(chans[1]));
+            float topL = hp2[0].process(hp1[0].process(chans[0]));
+            float topR = hp2[1].process(hp1[1].process(chans[1]));
+
+            float gSub = 1.0f - scEnv * subDuck;
+            float gTop = 1.0f - scEnv * topDuck;
+            maxGr = juce::jmax(maxGr, 1.0f - gSub);
+
+            float procL = (subL * gSub + topL * gTop) * trimGain;
+            float procR = (subR * gSub + topR * gTop) * trimGain;
+
+            float mSubL = monoLp2[0].process(monoLp1[0].process(procL));
+            float mSubR = monoLp2[1].process(monoLp1[1].process(procR));
+            float mTopL = monoHp2[0].process(monoHp1[0].process(procL));
+            float mTopR = monoHp2[1].process(monoHp1[1].process(procR));
+            float mSubMono = 0.5f * (mSubL + mSubR);
+
+            outL[i] = mSubMono + mTopL;
+            if (numCh > 1) outR[i] = mSubMono + mTopR;
         }
-        delayWriteIdx = (delayWriteIdx + 1) % kDelayBufSize;
-
-        // 3. LR4 Crossover & Independent Sub/Top Sidechain Ducking
-        float subL = lp2[0].process(lp1[0].process(chans[0]));
-        float subR = lp2[1].process(lp1[1].process(chans[1]));
-        float topL = hp2[0].process(hp1[0].process(chans[0]));
-        float topR = hp2[1].process(hp1[1].process(chans[1]));
-
-        float gSub = 1.0f - scEnv * subDuck;
-        float gTop = 1.0f - scEnv * topDuck;
-        maxGr = juce::jmax(maxGr, 1.0f - gSub);
-
-        float procL = subL * gSub + topL * gTop;
-        float procR = subR * gSub + topR * gTop;
-
-        // 4. Mono Sub (< monoSubHz)
-        float mSubL = monoLp2[0].process(monoLp1[0].process(procL));
-        float mSubR = monoLp2[1].process(monoLp1[1].process(procR));
-        float mTopL = monoHp2[0].process(monoHp1[0].process(procL));
-        float mTopR = monoHp2[1].process(monoHp1[1].process(procR));
-        float mSubMono = 0.5f * (mSubL + mSubR);
-
-        outL[i] = mSubMono + mTopL;
-        if (numCh > 1) outR[i] = mSubMono + mTopR;
 
         float bProcMono = 0.5f * (outL[i] + (numCh > 1 ? outR[i] : outL[i]));
-        dotSum += (double)kMono * (double)bProcMono;
-        eK += (double)kMono * (double)kMono;
-        eB += (double)bProcMono * (double)bProcMono;
+
+        // Measure Sub (<120Hz) correlation ONLY where Kick & Bass both have real sub energy
+        float kSub = corrKickLp2.process(corrKickLp1.process(kMono));
+        float bSub = corrBassLp2.process(corrBassLp1.process(bProcMono));
+        dotSub += (double)kSub * (double)bSub;
+        eKSub += (double)kSub * (double)kSub;
+        eBSub += (double)bSub * (double)bSub;
 
         if (lock.isLocked()) {
             capKick[capWriteIdx] = kMono;
@@ -237,12 +254,15 @@ void PsyKickBassProProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         }
     }
 
-    if (eK > 1e-7 && eB > 1e-7) {
-        float c = (float)(dotSum / std::sqrt(eK * eB));
+    // Only update liveCorr during real Kick+Bass overlap (prevents jumping against silence)
+    double rmsK = std::sqrt(eKSub / (double)numSamples);
+    double rmsB = std::sqrt(eBSub / (double)numSamples);
+    if (rmsK > 0.015 && rmsB > 0.015) {
+        float c = (float)(dotSub / std::sqrt(eKSub * eBSub));
         float prev = liveCorr.load();
-        liveCorr.store(prev * 0.7f + c * 0.3f);
+        liveCorr.store(prev * 0.65f + c * 0.35f);
     }
-    liveGrDb.store(juce::Decibels::gainToDecibels(juce::jmax(0.01f, 1.0f - maxGr)));
+    liveGrDb.store(isBypassed ? 0.0f : juce::Decibels::gainToDecibels(juce::jmax(0.01f, 1.0f - maxGr)));
 }
 
 void PsyKickBassProProcessor::runAutoPhaseLock() {
@@ -256,7 +276,6 @@ void PsyKickBassProProcessor::runAutoPhaseLock() {
         }
     }
 
-    // Lowpass both < 120Hz to optimize sub-bass phase alignment
     Biquad klp1, klp2, blp1, blp2;
     klp1.setLowpass(currentSampleRate, 120.0f);
     klp2.setLowpass(currentSampleRate, 120.0f);
@@ -271,7 +290,7 @@ void PsyKickBassProProcessor::runAutoPhaseLock() {
         bE += bBuf[i] * bBuf[i];
     }
 
-    if (kE < 1e-5 || bE < 1e-5) {
+    if (kE < 1e-4 || bE < 1e-4) {
         autoLockStatus = "Play Kick (Sidechain) + Bass in Ableton first!";
         syncUiFlag.store(true);
         return;
@@ -282,10 +301,10 @@ void PsyKickBassProProcessor::runAutoPhaseLock() {
     float bestPhase = 0.0f;
     float bestDelay = 0.0f;
 
-    // Search over Invert, Phase Angle (-150..+150 step 30), Micro-Delay (0..8ms step 0.5ms)
+    // Finer search: 15-deg steps & 0.25ms steps
     for (int invIdx = 0; invIdx < 2; ++invIdx) {
         bool candInv = (invIdx == 1);
-        for (int pDeg = -150; pDeg <= 150; pDeg += 30) {
+        for (int pDeg = -165; pDeg <= 165; pDeg += 15) {
             AllPass1 ap;
             float normDeg = std::abs((float)pDeg) / 180.0f;
             float apFc = 18.0f * std::pow(24.0f, normDeg);
@@ -301,8 +320,8 @@ void PsyKickBassProProcessor::runAutoPhaseLock() {
                 rotB[i] = v;
             }
 
-            for (int dStep = 0; dStep <= 16; ++dStep) {
-                float dMs = dStep * 0.5f;
+            for (int dStep = 0; dStep <= 32; ++dStep) {
+                float dMs = dStep * 0.25f;
                 int dSamp = (int)std::round(dMs * 0.001f * currentSampleRate);
                 double dot = 0.0, eCand = 0.0;
                 for (int i = dSamp; i < kCaptureSize; ++i) {
@@ -324,9 +343,10 @@ void PsyKickBassProProcessor::runAutoPhaseLock() {
     invert180.store(bestInv);
     phaseDeg.store(bestPhase);
     microDelayMs.store(bestDelay);
+    liveCorr.store((float)bestScore);
     autoLockStatus = "LOCKED! Sub Corr: " + juce::String(bestScore, 2)
         + " | Phase: " + juce::String((int)bestPhase) + "deg"
-        + " | Delay: " + juce::String(bestDelay, 1) + "ms"
+        + " | Delay: " + juce::String(bestDelay, 2) + "ms"
         + (bestInv ? " | 180 INV" : "");
     syncUiFlag.store(true);
 }
@@ -344,6 +364,7 @@ void PsyKickBassProProcessor::handleBridgeCommand(const juce::String& jsonStr) {
 
     if (obj->hasProperty("bassStyle")) bassStyle.store((int)obj->getProperty("bassStyle"));
     if (obj->hasProperty("scMode")) scMode.store((int)obj->getProperty("scMode"));
+    if (obj->hasProperty("bypassed")) bypassed.store((bool)obj->getProperty("bypassed"));
     if (obj->hasProperty("subDuck")) subDuckPct.store((float)obj->getProperty("subDuck"));
     if (obj->hasProperty("topDuck")) topDuckPct.store((float)obj->getProperty("topDuck"));
     if (obj->hasProperty("holdMs")) holdMs.store((float)obj->getProperty("holdMs"));
@@ -352,6 +373,7 @@ void PsyKickBassProProcessor::handleBridgeCommand(const juce::String& jsonStr) {
     if (obj->hasProperty("monoSubHz")) monoSubHz.store((float)obj->getProperty("monoSubHz"));
     if (obj->hasProperty("phaseDeg")) phaseDeg.store((float)obj->getProperty("phaseDeg"));
     if (obj->hasProperty("microDelayMs")) microDelayMs.store((float)obj->getProperty("microDelayMs"));
+    if (obj->hasProperty("bassTrimDb")) bassTrimDb.store((float)obj->getProperty("bassTrimDb"));
     if (obj->hasProperty("invert180")) invert180.store((bool)obj->getProperty("invert180"));
     if (obj->hasProperty("scThreshDb")) scThreshDb.store((float)obj->getProperty("scThreshDb"));
 }
@@ -395,6 +417,7 @@ void PsyKickBassProProcessor::getStateInformation(juce::MemoryBlock& destData) {
     juce::DynamicObject::Ptr obj = new juce::DynamicObject();
     obj->setProperty("bassStyle", bassStyle.load());
     obj->setProperty("scMode", scMode.load());
+    obj->setProperty("bypassed", bypassed.load());
     obj->setProperty("subDuck", subDuckPct.load());
     obj->setProperty("topDuck", topDuckPct.load());
     obj->setProperty("holdMs", holdMs.load());
@@ -403,6 +426,7 @@ void PsyKickBassProProcessor::getStateInformation(juce::MemoryBlock& destData) {
     obj->setProperty("monoSubHz", monoSubHz.load());
     obj->setProperty("phaseDeg", phaseDeg.load());
     obj->setProperty("microDelayMs", microDelayMs.load());
+    obj->setProperty("bassTrimDb", bassTrimDb.load());
     obj->setProperty("invert180", invert180.load());
     obj->setProperty("scThreshDb", scThreshDb.load());
     auto str = juce::JSON::toString(juce::var(obj.get()));
